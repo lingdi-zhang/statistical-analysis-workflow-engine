@@ -1,0 +1,18 @@
+name: longitudinal-omics-agent
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - scipy
+  - streamlit
+  - plotly
+  - matplotlib
+  - r-base=4.4
+  - r-lme4
+  - r-lmertest
+  - r-emmeans
+  - r-jsonlite
