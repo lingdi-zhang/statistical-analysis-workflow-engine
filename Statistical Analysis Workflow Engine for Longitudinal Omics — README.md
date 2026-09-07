@@ -269,7 +269,7 @@ Statistical-analysis-agent/
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/lingdi-zhang/statistical-analysis-workflow-engine.git
 cd Statistical-analysis-agent
 ```
 
