@@ -315,51 +315,6 @@ python -m unittest discover -s tests
 Rscript tests/regression.R
 ```
 
-The R checks cover feature/metadata name collisions, column names containing
-punctuation, and identical complete-case populations for model comparisons.
-With the environment's R dependencies installed, they also run categorical
-and longitudinal models and a generated sample dataset through the CSV/JSON command-line workflow.
-Without those dependencies, both Python/R and R integration checks report a skip.
-
-Data inspection stops the workflow if feature names overlap metadata columns
-(excluding `SampleID`), or if any categorical predictor group has no usable
-observations for a feature after excluding missing outcome and model variables.
-Expected groups are determined after sample alignment and optional subsetting.
-Longitudinal time must be numeric; its original measurement units are preserved.
-Inspection also rejects nonnumeric non-missing feature values, infinite values,
-features with no usable observations, and outcomes that are constant after
-complete-case filtering. Categorical labels are preserved across the Python/R
-transfer, including numeric labels such as `1.0`. Missing values use a
-collision-checked transfer marker so missing categorical values and subject IDs
-remain missing in R. Result tables use the same marker so literal identifiers
-such as `NA` and `null` remain intact. Failed mixed models include an error
-message; final and first-pass optimizer histories are available in the UI and
-as a downloadable diagnostics JSON file. Coefficients are selected by model term assignments,
-allowing category labels containing colons, spaces, and punctuation. Converged singular mixed models
-remain eligible for the random-slope fallback check; optimizer and convergence
-errors are tracked separately.
-Duplicate column names in either uploaded CSV are rejected before loading.
-Cross-sectional models with no residual degrees of freedom retain their
-estimates with `estimate_only` status and a warning. Their standard errors,
-p-values, and FDR values remain missing; they are counted separately from
-successful statistical tests and remain available in tables and feature plots.
-For multi-category predictors, estimates are retained in the pairwise table.
-
-Metadata is loaded as text so sample and subject identifiers and categorical
-labels retain leading zeros. Inspection detects numeric variables and converts
-only variables resolved as numeric. Result identifiers are also read as text.
-Changing analysis settings clears previous inspection and results; inspect the
-new settings before running models. Infinite numeric predictors, covariates,
-and time values stop inspection, including numeric-looking text set to Auto.
-Explicitly categorical text labels such as `inf` remain valid categories.
-Blank CSV cells represent missing values. UI uploads reject literal `NA` and
-`null` cells before inspection and modeling; these values are not silently
-converted to missing or analyzed as categories. Direct command-line CSV inputs
-bypass the UI validation and retain them as text labels. R also
-rejects nonnumeric non-missing values and infinity in numeric metadata before
-fitting; invalid numeric outcomes are reported as feature-level failures.
-Fixed-effects rank deficiency is checked in R on each feature's complete-case model matrix;
-affected features are reported as model failures while other features continue.
 
 ---
 
