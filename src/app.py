@@ -1,10 +1,11 @@
 import streamlit as st
-import pandas as pd
+from data_loading import read_sample_csv, read_metadata_csv
 
 from request_parse_streamlit import render_request_builder
 from inspector import DataInspector
 from r_runner import run_r_analysis
 from results import display_analysis_results
+from upload_signature import upload_signature
 
 
 # ============================================================
@@ -12,7 +13,7 @@ from results import display_analysis_results
 # ============================================================
 
 st.set_page_config(
-    page_title="Cross Sectional and Longitudinal Analysis Agent",
+    page_title="Omics Analysis Workbench",
     layout="wide"
 )
 
@@ -111,7 +112,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("Statistical Analysis Agent")
+st.title("Omics Analysis Workbench")
+st.caption("Cross-sectional and longitudinal statistical modeling.")
 
 st.write(
     "Upload your metadata and feature matrix, "
@@ -337,13 +339,13 @@ if (
     data_file is not None
 ):
 
-    metadata = pd.read_csv(
-        metadata_file
-    )
-
-    data_matrix = pd.read_csv(
-        data_file
-    )
+    try:
+        metadata = read_metadata_csv(metadata_file)
+        data_matrix = read_sample_csv(data_file)
+    except ValueError as error:
+        clear_inspection_and_results()
+        st.error(str(error))
+        st.stop()
 
     # --------------------------------------------------------
     # Detect changed uploads
@@ -352,12 +354,7 @@ if (
     # results should no longer be considered valid.
     # --------------------------------------------------------
 
-    current_upload_signature = (
-        metadata_file.name,
-        metadata_file.size,
-        data_file.name,
-        data_file.size
-    )
+    current_upload_signature = upload_signature(metadata_file, data_file)
 
     previous_upload_signature = (
         st.session_state.get(
@@ -427,7 +424,7 @@ if (
     # 2-3. Build analysis request
     # ========================================================
 
-    request = render_request_builder(
+    request, inspect_clicked = render_request_builder(
         metadata
     )
 
@@ -435,9 +432,11 @@ if (
     # 4. Run inspection only when user clicks Inspect Data
     # ========================================================
 
-    if (
-        request is not None
-    ):
+    if st.session_state.get("draft_request") != request:
+        clear_inspection_and_results()
+    st.session_state["draft_request"] = request
+
+    if inspect_clicked:
 
         # A newly submitted analysis request invalidates
         # previous model results.
@@ -535,6 +534,8 @@ if (
             st.header(
                 "5. Run Analysis"
             )
+
+            st.json(st.session_state["inspection_request"])
 
             st.write(
                 "The data have already been inspected. "

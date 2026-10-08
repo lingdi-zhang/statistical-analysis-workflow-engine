@@ -10,9 +10,16 @@ prepare_model_variables <- function(
 
         if (variable_type == "numeric") {
 
-            dat[[variable]] <- as.numeric(
-                dat[[variable]]
-            )
+            values <- dat[[variable]]
+            if (is.factor(values)) values <- as.character(values)
+            converted <- suppressWarnings(as.numeric(values))
+            if (any(!is.na(values) & is.na(converted))) {
+                stop(paste0("Numeric variable '", variable, "' contains nonnumeric non-missing values."))
+            }
+            if (any(is.infinite(converted))) {
+                stop(paste0("Numeric variable '", variable, "' contains infinite values."))
+            }
+            dat[[variable]] <- converted
 
         } else if (variable_type == "categorical") {
 

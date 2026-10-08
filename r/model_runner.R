@@ -2,6 +2,184 @@ library(lme4)
 library(lmerTest)
 library(emmeans)
 
+# Match uploaded sample tables; tables without IDs retain the positional API.
+align_sample_tables <- function(metadata, data_matrix) {
+    if (!all(vapply(list(metadata, data_matrix), function(table) {
+        "SampleID" %in% names(table)
+    }, logical(1)))) {
+        if (nrow(metadata) != nrow(data_matrix)) {
+            stop("Tables without SampleID must have the same number of rows.")
+        }
+        return(list(metadata = metadata, data_matrix = data_matrix))
+    }
+    for (table in list(metadata, data_matrix)) {
+        ids <- as.character(table$SampleID)
+        if (anyNA(ids) || any(!nzchar(ids))) stop("SampleID values must not be missing or blank.")
+        if (anyDuplicated(ids)) stop("SampleID values must be unique in each table.")
+    }
+    metadata_ids <- as.character(metadata$SampleID)
+    feature_ids <- as.character(data_matrix$SampleID)
+    shared <- metadata_ids %in% feature_ids
+    if (!any(shared)) stop("Metadata and feature matrix have no shared SampleID values.")
+    if (!all(shared) || any(!feature_ids %in% metadata_ids)) {
+        warning("Unmatched samples were removed before modeling.")
+    }
+    metadata <- metadata[shared, , drop = FALSE]
+    data_matrix <- data_matrix[match(as.character(metadata$SampleID), feature_ids), , drop = FALSE]
+    list(metadata = metadata, data_matrix = data_matrix)
+}
+
+converged_singular_fraction <- function(results) {
+    valid <- results$converged %in% TRUE & !is.na(results$singular)
+    if (any(valid)) mean(results$singular[valid]) else NA_real_
+}
+
+bind_feature_results <- function(results) {
+    columns <- unique(unlist(lapply(results, names), use.names = FALSE))
+    results <- lapply(results, function(result) {
+        for (column in setdiff(columns, names(result))) result[[column]] <- NA
+        result[, columns, drop = FALSE]
+    })
+    do.call(rbind, results)
+}
+
+validate_fixed_effects_rank <- function(formula, data) {
+    design <- model.matrix(formula, data = data)
+    if (qr(design)$rank < ncol(design)) {
+        stop("Fixed-effects model is rank deficient: effects are not identifiable after covariate adjustment on the usable observations.")
+    }
+    invisible(TRUE)
+}
+
+# Build formulas with internal names, and use one complete-case population
+# for all full/reduced fits belonging to a feature.
+prepare_feature_model <- function(data, outcome, predictor, predictor_type,
+                                  covariates, time = NULL, subject_id = NULL) {
+    required <- unique(c(outcome, predictor, covariates, time, subject_id))
+    if (!all(required %in% names(data))) stop("Model variables are missing from metadata.")
+    categorical <- predictor_type %in% c("categorical", "ordered_categorical")
+    expected_categories <- if (categorical) unique(as.character(na.omit(data[[predictor]]))) else NULL
+    for (variable in unique(c(outcome, time,
+                              if (predictor_type == "numeric") predictor))) {
+        values <- data[[variable]]
+        if (is.factor(values)) values <- as.character(values)
+        converted <- suppressWarnings(as.numeric(values))
+        if (any(!is.na(values) & is.na(converted))) {
+            stop(paste0("Numeric variable '", variable, "' contains nonnumeric non-missing values."))
+        }
+        if (any(is.infinite(converted))) {
+            stop(paste0("Numeric variable '", variable, "' contains infinite values."))
+        }
+        data[[variable]] <- converted
+    }
+    for (variable in covariates) {
+        if (is.numeric(data[[variable]]) && any(is.infinite(data[[variable]]))) {
+            stop(paste0("Numeric covariate '", variable, "' contains infinite values."))
+        }
+    }
+    data <- data[complete.cases(data[, required, drop = FALSE]), , drop = FALSE]
+    if (categorical) {
+        missing_categories <- setdiff(expected_categories, as.character(data[[predictor]]))
+        if (length(missing_categories)) {
+            stop(paste("No usable observations for predictor categories:",
+                       paste(missing_categories, collapse = ", ")))
+        }
+    }
+    original <- names(data)
+    # Reserve a prefix absent from original names and category labels, so
+    # coefficient suffixes cannot be mistaken for internal variable names.
+    labels <- c(original, unlist(lapply(data, function(values) {
+        if (is.factor(values)) return(c(levels(values), as.character(values)))
+        if (is.character(values)) return(values)
+        character(0)
+    }), use.names = FALSE))
+    labels <- labels[!is.na(labels)]
+    prefix <- "modelvar"
+    while (any(grepl(prefix, labels, fixed = TRUE))) prefix <- paste0(prefix, "X")
+    internal <- sprintf("%s%06dX", prefix, seq_along(original))
+    names(data) <- internal
+    mapping <- setNames(internal, original)
+    list(data = data, mapping = mapping)
+}
+
+restore_model_labels <- function(result, mapping) {
+    internal <- unname(mapping)
+    originals <- names(mapping)
+    # Matches are located in the untouched term, then replaced together.
+    # Restored names are never scanned again, even if they contain tokens.
+    restore_term <- function(value) {
+        if (is.na(value)) return(NA_character_)
+        matches <- gregexpr(paste(internal, collapse = "|"), value, perl = TRUE)
+        tokens <- regmatches(value, matches)[[1]]
+        if (length(tokens)) {
+            regmatches(value, matches) <- list(originals[match(tokens, internal)])
+        }
+        value
+    }
+    for (table in c("overall", "pairwise")) {
+        if (is.null(result[[table]])) next
+        for (column in intersect(c("feature", "predictor", "term"),
+                                 names(result[[table]]))) {
+            values <- as.character(result[[table]][[column]])
+            if (column == "term") {
+                values <- vapply(values, restore_term, character(1), USE.NAMES = FALSE)
+            } else {
+                matched <- match(values, internal)
+                found <- !is.na(matched)
+                values[found] <- originals[matched[found]]
+            }
+            result[[table]][[column]] <- values
+        }
+    }
+    result
+}
+
+run_cross_sectional_feature <- function(data, outcome, predictor, predictor_type,
+                                       covariates = character(0), ordered_levels = NULL) {
+    covariates <- as.character(unlist(covariates, use.names = FALSE))
+    prepared <- prepare_feature_model(data, outcome, predictor, predictor_type, covariates)
+    mapping <- prepared$mapping
+    result <- run_cross_sectional_feature_impl(
+        data = prepared$data, outcome = unname(mapping[outcome]),
+        predictor = unname(mapping[predictor]), predictor_type = predictor_type,
+        covariates = unname(mapping[covariates]), ordered_levels = ordered_levels)
+    if (identical(result$overall$status, "estimate_only")) {
+        result$overall$std_error <- NA_real_
+        result$overall$p_value <- NA_real_
+    }
+    restore_model_labels(result, mapping)
+}
+
+run_longitudinal_feature <- function(data, outcome, predictor, predictor_type,
+                                    time, subject_id,
+                                    analysis_goal = c("overall_predictor_association",
+                                                      "time_effect", "trajectory_difference"),
+                                    covariates = character(0), ordered_levels = NULL,
+                                    random_slope = TRUE) {
+    analysis_goal <- match.arg(analysis_goal)
+    covariates <- as.character(unlist(covariates, use.names = FALSE))
+    prepared <- prepare_feature_model(data, outcome, predictor, predictor_type,
+                                      covariates, time, subject_id)
+    mapping <- prepared$mapping
+    n_subjects <- length(unique(prepared$data[[mapping[[subject_id]]]]))
+    if (random_slope && nrow(prepared$data) <= 2L * n_subjects) {
+        stop(paste0("Random intercept + time slope is unsupported: ",
+                    nrow(prepared$data), " usable observations for ", n_subjects,
+                    " subjects (", 2L * n_subjects, " random effects). ",
+                    "Select random intercept only and inspect again; the selected model was not changed."))
+    }
+    result <- run_longitudinal_feature_impl(
+        data = prepared$data, outcome = unname(mapping[outcome]),
+        predictor = unname(mapping[predictor]), predictor_type = predictor_type,
+        time = unname(mapping[time]), subject_id = unname(mapping[subject_id]),
+        analysis_goal = analysis_goal, covariates = unname(mapping[covariates]),
+        ordered_levels = ordered_levels, random_slope = random_slope)
+    if (!isTRUE(result$overall$converged)) {
+        result$overall$error <- failure_message(result$diagnostics)
+    }
+    restore_model_labels(result, mapping)
+}
+
 # ============================================================
 # Helper: prepare primary predictor
 # ============================================================
@@ -222,6 +400,22 @@ build_rhs <- function(
 #   "overall_and_pairwise"
 # ============================================================
 
+# Select columns by their formula term, independently of factor-level text.
+coefficient_for_variables <- function(fit, variables) {
+    design <- model.matrix(fit)
+    factors <- attr(terms(fit), "factors")
+    term_ids <- which(vapply(seq_len(ncol(factors)), function(i) {
+        setequal(rownames(factors)[factors[, i] != 0], variables)
+    }, logical(1)))
+    matched <- colnames(design)[attr(design, "assign") %in% term_ids]
+    matched <- intersect(matched, rownames(summary(fit)$coefficients))
+    if (length(matched) != 1L) {
+        stop(paste("Expected one coefficient for", paste(variables, collapse = ":"),
+                   "but found", length(matched)))
+    }
+    matched[[1]]
+}
+
 extract_primary_coefficient <- function(
     fit,
     predictor,
@@ -245,110 +439,10 @@ extract_primary_coefficient <- function(
 
     sm <- summary(fit)$coefficients
 
-    coef_names <- rownames(sm)
-
-
-    # ========================================================
-    # Ordered trend
-    #
-    # predictor here is already something like:
-    # Severity_trend
-    # ========================================================
-
-    if (strategy == "ordered_trend") {
-
-        term <- predictor
-
-
-        if (!term %in% coef_names) {
-
-            stop(
-                paste(
-                    "Trend coefficient",
-                    term,
-                    "was not found."
-                )
-            )
-        }
+    if (!strategy %in% c("coefficient", "ordered_trend")) {
+        stop(paste("Unknown extraction strategy:", strategy))
     }
-
-
-    # ========================================================
-    # Numeric or binary categorical
-    # ========================================================
-
-    else if (strategy == "coefficient") {
-
-        # ----------------------------------------------------
-        # Numeric predictor:
-        # exact coefficient exists
-        #
-        # Age -> Age
-        # ----------------------------------------------------
-
-        if (predictor %in% coef_names) {
-
-            term <- predictor
-
-        } else {
-
-            # ------------------------------------------------
-            # Binary categorical predictor:
-            #
-            # FA -> FAYes
-            # Treatment -> TreatmentDrug
-            # ------------------------------------------------
-
-            matched <- coef_names[
-                startsWith(
-                    coef_names,
-                    predictor
-                )
-            ]
-
-
-            # Exclude interaction terms if present
-            matched <- matched[
-                !grepl(
-                    ":",
-                    matched,
-                    fixed = TRUE
-                )
-            ]
-
-
-            if (length(matched) != 1) {
-
-                stop(
-                    paste(
-                        "Expected one coefficient for",
-                        predictor,
-                        "but found",
-                        length(matched)
-                    )
-                )
-            }
-
-
-            term <- matched[1]
-        }
-    }
-
-
-    # ========================================================
-    # Unknown strategy
-    # ========================================================
-
-    else {
-
-        stop(
-            paste(
-                "Unknown extraction strategy:",
-                strategy
-            )
-        )
-    }
-
+    term <- coefficient_for_variables(fit, predictor)
 
     # --------------------------------------------------------
     # Extract result
@@ -386,7 +480,9 @@ extract_primary_coefficient <- function(
 # Cross-sectional analysis
 # ============================================================
 
-run_cross_sectional_feature <- function(
+estimate_only_warning <- "Estimate only: insufficient residual degrees of freedom to calculate uncertainty or significance."
+
+run_cross_sectional_feature_impl <- function(
     data,
     outcome,
     predictor,
@@ -466,6 +562,7 @@ run_cross_sectional_feature <- function(
         # Fit model
         # ----------------------------------------------------
 
+        validate_fixed_effects_rank(formula, dat)
         fit <- lm(
             formula,
             data = dat
@@ -506,7 +603,8 @@ run_cross_sectional_feature <- function(
             p_value = coef_result$p_value,
 
             n_obs = nobs(fit),
-
+            status = if (df.residual(fit) <= 0) "estimate_only" else "success",
+            warning = if (df.residual(fit) <= 0) estimate_only_warning else NA_character_,
             stringsAsFactors = FALSE
         )
 
@@ -595,6 +693,8 @@ run_cross_sectional_feature <- function(
         # Fit reduced and full models
         # ----------------------------------------------------
 
+        validate_fixed_effects_rank(full_formula, dat)
+        validate_fixed_effects_rank(reduced_formula, dat)
         fit0 <- lm(
             reduced_formula,
             data = dat
@@ -618,6 +718,7 @@ run_cross_sectional_feature <- function(
 
 
         overall_p <- test$`Pr(>F)`[2]
+        estimate_only <- df.residual(fit1) <= 0
 
 
         overall_result <- data.frame(
@@ -639,7 +740,8 @@ run_cross_sectional_feature <- function(
             p_value = overall_p,
 
             n_obs = nobs(fit1),
-
+            status = if (estimate_only) "estimate_only" else "success",
+            warning = if (estimate_only) estimate_only_warning else NA_character_,
             stringsAsFactors = FALSE
         )
 
@@ -693,6 +795,15 @@ run_cross_sectional_feature <- function(
         ]
 
 
+        if (estimate_only) {
+            overall_result$p_value <- NA_real_
+            pairwise_result$SE <- NA_real_
+            pairwise_result$t.ratio <- NA_real_
+            pairwise_result$p.value <- NA_real_
+            pairwise_result$status <- "estimate_only"
+            pairwise_result$warning <- estimate_only_warning
+        }
+
         return(
             list(
                 overall = overall_result,
@@ -724,6 +835,10 @@ run_cross_sectional_omics <- function(
     ordered_levels = NULL
 ) {
 
+    aligned <- align_sample_tables(metadata, data_matrix)
+    metadata <- aligned$metadata
+    data_matrix <- aligned$data_matrix
+
     overall_results <- list()
     pairwise_results <- list()
 
@@ -754,13 +869,14 @@ run_cross_sectional_omics <- function(
         # ----------------------------------------------------
         # Add current outcome to metadata
         #
-        # Assumes metadata and data_matrix rows are already
-        # matched and in the same order.
+        # Sample tables were aligned before entering the feature loop.
         # ----------------------------------------------------
 
         dat <- metadata
 
-        dat[[feature]] <- (
+        outcome_column <- make.unique(c(names(dat), "analysis_outcome"))[ncol(dat) + 1L]
+
+        dat[[outcome_column]] <- (
             data_matrix[[feature]]
         )
 
@@ -777,7 +893,7 @@ run_cross_sectional_omics <- function(
 
                 run_cross_sectional_feature(
                     data = dat,
-                    outcome = feature,
+                    outcome = outcome_column,
                     predictor = predictor,
                     predictor_type = predictor_type,
                     covariates = covariates,
@@ -819,6 +935,7 @@ run_cross_sectional_omics <- function(
                         n_obs =
                             NA_real_,
 
+                        status = "failed",
                         error =
                             conditionMessage(e),
 
@@ -836,6 +953,9 @@ run_cross_sectional_omics <- function(
         # ----------------------------------------------------
         # Store main result
         # ----------------------------------------------------
+
+        result$overall$feature <- feature
+        if (!is.null(result$pairwise)) result$pairwise$feature <- feature
 
         overall_results[[feature]] <- (
             result$overall
@@ -866,10 +986,7 @@ run_cross_sectional_omics <- function(
     # Combine main / overall results
     # ========================================================
 
-    overall_results <- do.call(
-        rbind,
-        overall_results
-    )
+    overall_results <- bind_feature_results(overall_results)
 
     rownames(
         overall_results
@@ -1010,37 +1127,7 @@ extract_interaction_coefficient <- function(
         summary(fit)
     )
 
-    terms <- rownames(sm)
-
-    matched <- terms[
-        grepl(
-            model_predictor,
-            terms,
-            fixed = TRUE
-        ) &
-        grepl(
-            time,
-            terms,
-            fixed = TRUE
-        ) &
-        grepl(
-            ":",
-            terms,
-            fixed = TRUE
-        )
-    ]
-
-    if (length(matched) != 1) {
-
-        stop(
-            paste(
-                "Expected one interaction term but found",
-                length(matched)
-            )
-        )
-    }
-
-    term <- matched[1]
+    term <- coefficient_for_variables(fit, c(model_predictor, time))
 
     data.frame(
         term = term,
@@ -1158,12 +1245,16 @@ check_lmer_convergence <- function(
     messages <- (
         fit@optinfo$conv$lme4$messages
     )
-
-
-    converged <- (
-        is.null(messages) ||
-        length(messages) == 0
-    )
+    # A boundary/singular fit can have a successful optimizer. Singularity
+    # is tracked separately and must remain eligible for the fallback pass.
+    messages <- messages[!grepl("boundary (singular) fit", messages, fixed = TRUE)]
+    optimizer_codes <- unlist(fit@optinfo$conv$opt)
+    optimizer_ok <- all(optimizer_codes == 0)
+    converged <- optimizer_ok && length(messages) == 0
+    if (!optimizer_ok) {
+        messages <- c(messages, paste("Optimizer convergence code:",
+                                     paste(optimizer_codes, collapse = ", ")))
+    }
 
 
     list(
@@ -1194,11 +1285,21 @@ check_lmer_convergence <- function(
 # Does NOT change random effects.
 # ============================================================
 
+failure_message <- function(history) {
+    values <- unlist(history, recursive = TRUE, use.names = TRUE)
+    messages <- as.character(values[grepl("(^|\\.)(message|error)$", names(values))])
+    messages <- unique(messages[!is.na(messages) & nzchar(messages)])
+    if (!length(messages)) return("Model fitting failed without a diagnostic message.")
+    paste(messages, collapse = "; ")
+}
+
 fit_with_optimizer_retries <- function(
     formula,
     data,
     REML = FALSE
 ) {
+
+    validate_fixed_effects_rank(lme4::nobars(formula), data)
 
     optimizers <- c(
         "nloptwrap",
@@ -1245,6 +1346,8 @@ fit_with_optimizer_retries <- function(
 
         if (is.null(fit)) {
 
+            last_optimizer <- optimizer
+            last_message <- error_message
             history[[optimizer]] <- list(
                 optimizer = optimizer,
                 fitted = FALSE,
@@ -1340,7 +1443,7 @@ build_random_term <- function(
 # Run one longitudinal feature
 # ============================================================
 
-run_longitudinal_feature <- function(
+run_longitudinal_feature_impl <- function(
     data,
     outcome,
     predictor,
@@ -2027,6 +2130,10 @@ run_longitudinal_pass <- function(
     random_slope = TRUE
 ) {
 
+    aligned <- align_sample_tables(metadata, data_matrix)
+    metadata <- aligned$metadata
+    data_matrix <- aligned$data_matrix
+
     # ========================================================
     # Containers
     # ========================================================
@@ -2066,14 +2173,14 @@ run_longitudinal_pass <- function(
         # ----------------------------------------------------
         # Add current outcome to metadata.
         #
-        # IMPORTANT:
-        # This assumes metadata and data_matrix rows have
-        # already been matched and are in the same order.
+        # Sample tables were aligned before entering the feature loop.
         # ----------------------------------------------------
 
         dat <- metadata
 
-        dat[[feature]] <- (
+        outcome_column <- make.unique(c(names(dat), "analysis_outcome"))[ncol(dat) + 1L]
+
+        dat[[outcome_column]] <- (
             data_matrix[[feature]]
         )
 
@@ -2106,7 +2213,7 @@ run_longitudinal_pass <- function(
 
                     data = dat,
 
-                    outcome = feature,
+                    outcome = outcome_column,
 
                     predictor = predictor,
 
@@ -2202,7 +2309,7 @@ run_longitudinal_pass <- function(
 
 
                     diagnostics =
-                        NULL
+                        list(error = conditionMessage(e))
                 )
             }
         )
@@ -2225,6 +2332,9 @@ run_longitudinal_pass <- function(
         # multi-category:
         #   overall association / interaction p
         # ====================================================
+
+        result$overall$feature <- feature
+        if (!is.null(result$pairwise)) result$pairwise$feature <- feature
 
         overall_results[[feature]] <- (
             result$overall
@@ -2286,10 +2396,7 @@ run_longitudinal_pass <- function(
     # Combine primary / overall results
     # ========================================================
 
-    overall_results <- do.call(
-        rbind,
-        overall_results
-    )
+    overall_results <- bind_feature_results(overall_results)
 
 
     rownames(
@@ -2624,8 +2731,7 @@ run_longitudinal_omics <- function(
                 convergence_fraction =
                     first_pass$convergence_fraction,
 
-                singular_fraction =
-                    NA_real_
+                singular_fraction = converged_singular_fraction(first_results)
             )
         )
     }
@@ -2881,8 +2987,9 @@ run_longitudinal_omics <- function(
             convergence_fraction =
                 second_pass$convergence_fraction,
 
-            singular_fraction =
-                singular_fraction,
+            singular_fraction = converged_singular_fraction(second_pass$overall),
+
+            first_pass_singular_fraction = singular_fraction,
 
             singularity_threshold =
                 singularity_threshold,
@@ -2904,8 +3011,3 @@ run_longitudinal_omics <- function(
         )
     )
 }
-
-
-
-
-

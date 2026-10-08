@@ -1,6 +1,0 @@
-FeatureRange,ExpectedSignal,SuggestedTest,ExpectedDirection
-Gene_001–Gene_005,phenotype overall association,overall_association,Positive phenotype coefficient
-Gene_006–Gene_010,Time effect,time_effect,Positive Visit coefficient
-Gene_011–Gene_015,phenotype × Visit interaction,trajectory_difference,Positive phenotype:Visit coefficient
-Gene_016–Gene_020,Batch effect only,covariate control,Batch2 higher
-Gene_021–Gene_050,Noise,negative controls,Mostly nonsignificant

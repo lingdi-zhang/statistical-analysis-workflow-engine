@@ -1,3 +1,4 @@
+import json
 from io import BytesIO
 
 import numpy as np
@@ -73,6 +74,14 @@ def display_analysis_results(
 ):
 
     results = analysis_output["overall"]
+    diagnostics = analysis_output.get("diagnostics", {})
+    if diagnostics and any(diagnostics.values()):
+        with st.expander("Optimizer diagnostics"):
+            st.json(diagnostics)
+            st.download_button(
+                "Download optimizer diagnostics", data=json.dumps(diagnostics, indent=2),
+                file_name="diagnostics.json", mime="application/json", key="download_diagnostics"
+            )
 
     pairwise = analysis_output.get(
         "pairwise"
@@ -370,6 +379,9 @@ def display_model_summary(
     request
 ):
 
+    if summary.get("warning"):
+        st.warning(summary["warning"])
+
     analysis_type = (
         request["analysis_type"]
     )
@@ -387,6 +399,11 @@ def display_model_summary(
             "**Model used:** Linear regression"
         )
 
+        st.write(f"**Successful statistical tests:** {summary.get('n_successful', 0)}")
+        st.write(f"**Estimate-only features:** {summary.get('n_estimate_only', 0)}")
+        st.write(f"**Features failed:** {summary.get('n_failed', 0)}")
+        if summary.get("n_estimate_only", 0):
+            st.warning("Estimate-only features have insufficient residual degrees of freedom to calculate uncertainty or significance.")
         return
 
     if (
@@ -484,43 +501,28 @@ def display_model_summary(
                 f"{convergence_fraction:.1%}"
             )
 
-        singular_fraction = (
-            summary.get(
-                "singular_fraction"
-            )
-        )
-
-        if (
-            singular_fraction
-            is None
-        ):
-
-            singular_fraction = (
-                summary.get(
-                    "first_pass_singular_fraction"
+        singular_fraction = summary.get("singular_fraction")
+        if summary.get("rerun", False):
+            initial_fraction = summary.get("first_pass_singular_fraction")
+            if initial_fraction is not None:
+                st.write(
+                    "**Initial random-slope singularity:** "
+                    f"{initial_fraction:.1%}"
                 )
-            )
-
-        if (
-            singular_fraction
-            is not None
-        ):
-
-            st.write(
-                "**Random-slope singularity fraction:** "
-                f"{singular_fraction:.1%}"
-            )
-
-        if summary.get(
-            "rerun",
-            False
-        ):
-
+            if singular_fraction is not None:
+                st.write(
+                    "**Final random-intercept singularity:** "
+                    f"{singular_fraction:.1%}"
+                )
+            else:
+                st.write("**Final random-intercept singularity:** Unavailable")
             st.warning(
-                "The initial random-slope analysis showed "
-                "widespread singularity. All features were "
-                "rerun using a common random-intercept model."
+                "The initial random-slope singularity fraction reached the "
+                "configured fallback threshold. All features were rerun "
+                "using a common random-intercept model."
             )
+        elif singular_fraction is not None:
+            st.write(f"**Singularity fraction:** {singular_fraction:.1%}")
 
         n_converged = (
             summary.get(
@@ -569,7 +571,10 @@ def display_results_table(
         "n_obs",
         "converged",
         "singular",
-        "optimizer"
+        "optimizer",
+        "status",
+        "warning",
+        "error"
     ]
 
     columns = [
@@ -1257,6 +1262,10 @@ def display_feature_statistics(
         .iloc[0]
     )
 
+    warning = row.get("warning")
+    if pd.notna(warning) and warning:
+        st.warning(str(warning))
+
     metric_columns = (
         st.columns(3)
     )
@@ -1874,7 +1883,7 @@ def plot_longitudinal_categorical(
         sems = []
         positions = []
 
-        for time_index, time_value in enumerate(time_levels):
+        for time_value in time_levels:
 
             values = (
                 group_data.loc[
@@ -1895,7 +1904,7 @@ def plot_longitudinal_categorical(
             )
 
             ax.scatter(
-                np.full(len(values), time_index) + jitter,
+                np.full(len(values), float(time_value)) + jitter,
                 values,
                 alpha=0.35,
                 s=24,
@@ -1908,7 +1917,7 @@ def plot_longitudinal_categorical(
                 if len(values) > 1
                 else 0.0
             )
-            positions.append(time_index)
+            positions.append(float(time_value))
 
         if len(positions) == 0:
             continue
@@ -1934,7 +1943,7 @@ def plot_longitudinal_categorical(
             color=color
         )
 
-    ax.set_xticks(range(len(time_levels)))
+    ax.set_xticks([float(value) for value in time_levels])
     ax.set_xticklabels([str(value) for value in time_levels])
     ax.set_xlabel(time_variable)
     ax.set_ylabel(feature)
@@ -1994,7 +2003,7 @@ def plot_longitudinal_time_effect(
     sems = []
     positions = []
 
-    for time_index, time_value in enumerate(time_levels):
+    for time_value in time_levels:
 
         values = (
             data.loc[
@@ -2015,7 +2024,7 @@ def plot_longitudinal_time_effect(
         )
 
         ax.scatter(
-            np.full(len(values), time_index) + jitter,
+            np.full(len(values), float(time_value)) + jitter,
             values,
             alpha=0.35,
             s=24,
@@ -2028,7 +2037,7 @@ def plot_longitudinal_time_effect(
             if len(values) > 1
             else 0.0
         )
-        positions.append(time_index)
+        positions.append(float(time_value))
 
     if len(positions) == 0:
         plt.close(fig)
@@ -2054,7 +2063,7 @@ def plot_longitudinal_time_effect(
         color=color
     )
 
-    ax.set_xticks(range(len(time_levels)))
+    ax.set_xticks([float(value) for value in time_levels])
     ax.set_xticklabels([str(value) for value in time_levels])
     ax.set_xlabel(time_variable)
     ax.set_ylabel(feature)
@@ -2122,23 +2131,7 @@ def plot_longitudinal_numeric_predictor(
         )
     )
 
-    time_map = {
-        value: index
-        for index, value
-        in enumerate(
-            time_levels
-        )
-    }
-
-    x = (
-        data[
-            time_variable
-        ]
-        .map(
-            time_map
-        )
-        .astype(float)
-    )
+    x = pd.to_numeric(data[time_variable])
 
     fig, ax = plt.subplots(
         figsize=(8, 5)
@@ -2166,13 +2159,7 @@ def plot_longitudinal_numeric_predictor(
         predictor
     )
 
-    ax.set_xticks(
-        range(
-            len(
-                time_levels
-            )
-        )
-    )
+    ax.set_xticks([float(value) for value in time_levels])
 
     ax.set_xticklabels(
         [

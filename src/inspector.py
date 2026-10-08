@@ -120,6 +120,14 @@ class DataInspector:
             report["variables"]
         )
 
+        if self.errors:
+            return self._finish_report(report)
+
+        self._validate_feature_model_inputs()
+
+        if self.errors:
+            return self._finish_report(report)
+
         # -----------------------------------------------------
         # 7. Longitudinal-specific inspection
         # -----------------------------------------------------
@@ -797,6 +805,11 @@ class DataInspector:
         variable
     ):
 
+        # Time is measured numerically even when only two visits are observed.
+        if (self.request.get("analysis_type") == "longitudinal"
+                and variable == self.request.get("time")):
+            return "numeric"
+
         requested_types = (
             self.request.get(
                 "variable_types",
@@ -845,9 +858,8 @@ class DataInspector:
 
             return "categorical"
 
-        if pd.api.types.is_numeric_dtype(
-            x
-        ):
+        if (pd.api.types.is_numeric_dtype(x)
+                or pd.to_numeric(x, errors="coerce").notna().all()):
 
             n_unique = (
                 x.nunique()
@@ -881,6 +893,16 @@ class DataInspector:
                 variable
             )
         )
+
+        # Auto detection can classify a two-valued numeric column as categorical;
+        # that must not turn numeric infinity into an acceptable category.
+        requested_type = self.request.get("variable_types", {}).get(variable, "auto")
+        if resolved_type != "numeric" and (
+                pd.api.types.is_numeric_dtype(series) or requested_type == "auto"):
+            numeric_values = pd.to_numeric(series, errors="coerce")
+            infinite_n = int(numeric_values.isin([float("inf"), float("-inf")]).sum())
+            if infinite_n:
+                self.errors.append(f"{variable} contains {infinite_n} infinite numeric values.")
 
         missing_n = int(
             series
@@ -941,6 +963,15 @@ class DataInspector:
                 )
             )
 
+            infinite_values = numeric.isin([float("inf"), float("-inf")])
+            infinite_n = int(infinite_values.sum())
+            if infinite_n:
+                self.errors.append(
+                    f"{variable} contains {infinite_n} infinite numeric values."
+                )
+                # Calculate descriptive statistics on finite values only.
+                numeric = numeric.mask(infinite_values)
+
             out.update({
                 "mean":
                     self._safe_float(
@@ -972,6 +1003,7 @@ class DataInspector:
                 (
                     series.notna()
                     & numeric.isna()
+                    & ~infinite_values
                 )
                 .sum()
             )
@@ -983,6 +1015,8 @@ class DataInspector:
                     f"but {invalid_numeric} non-missing values "
                     "could not be converted to numeric."
                 )
+
+            self.metadata[variable] = numeric
 
             if unique_n < 2:
 
@@ -1377,6 +1411,87 @@ class DataInspector:
             "request":
                 self.request
         }
+
+    def _validate_feature_model_inputs(self):
+        """Reject collisions and category loss before any models are run."""
+        if self.data_matrix is None:
+            return
+
+        features = [name for name in self.data_matrix.columns if name != "SampleID"]
+        for feature in features:
+            if feature in self.metadata.columns:
+                self.errors.append(
+                    f"Feature '{feature}' conflicts with metadata column '{feature}'."
+                )
+
+        predictor = self.request["primary_predictors"][0]
+        types = self.request["variable_types"]
+        categorical = types.get(predictor) in ("categorical", "ordered_categorical")
+
+        if not features:
+            self.errors.append("Feature matrix contains no outcome columns.")
+            return
+
+        required = list(dict.fromkeys(
+            [predictor] + self.request.get("covariates", [])
+            + ([self.request["time"], self.request["subject_id"]]
+               if self.request["analysis_type"] == "longitudinal" else [])
+        ))
+        model_metadata = self.metadata[required].copy()
+        for variable in required:
+            if types.get(variable) == "numeric":
+                model_metadata[variable] = pd.to_numeric(
+                    model_metadata[variable], errors="coerce"
+                )
+
+        # Alignment is by SampleID, independent of DataFrame row indexes.
+        model_metadata.index = self.metadata["SampleID"]
+        expected = set(model_metadata[predictor].dropna().astype(str))
+        metadata_complete = model_metadata.notna().all(axis=1)
+        outcomes = self.data_matrix.set_index("SampleID")
+        for feature in features:
+            raw = outcomes[feature]
+            outcome = pd.to_numeric(raw, errors="coerce")
+            invalid = int((raw.notna() & outcome.isna()).sum())
+            infinite = outcome.isin([float("inf"), float("-inf")])
+            if invalid:
+                self.errors.append(
+                    f"Feature '{feature}' contains {invalid} nonnumeric non-missing values."
+                )
+            if infinite.any():
+                self.errors.append(f"Feature '{feature}' contains infinite values.")
+            outcome = outcome.mask(infinite)
+            usable = metadata_complete & outcome.reindex(model_metadata.index).notna()
+            usable_outcome = outcome.reindex(model_metadata.index)[usable]
+            if usable_outcome.empty:
+                self.errors.append(
+                    f"Feature '{feature}' has no usable observations after excluding missing model values."
+                )
+            elif usable_outcome.nunique() < 2:
+                self.errors.append(
+                    f"Feature '{feature}' is constant after excluding missing model values."
+                )
+            if (self.request["analysis_type"] == "longitudinal"
+                    and self.request.get("random_slope", True)):
+                n_subjects = model_metadata.loc[usable, self.request["subject_id"]].nunique()
+                n_observations = int(usable.sum())
+                if n_subjects and n_observations <= 2 * n_subjects:
+                    self.warnings.append(
+                        f"Feature '{feature}': random intercept + time slope is unsupported "
+                        f"with {n_observations} usable observations for {n_subjects} subjects "
+                        f"({2 * n_subjects} random effects). Select 'Random intercept only' "
+                        "and inspect again. The selected model will not be changed automatically."
+                    )
+            if not categorical:
+                continue
+            observed = set(model_metadata.loc[usable, predictor].astype(str))
+            missing = sorted(expected - observed)
+            if missing:
+                self.errors.append(
+                    f"Feature '{feature}' has no usable observations for predictor "
+                    f"'{predictor}' categories: {', '.join(missing)} after excluding "
+                    "missing model values."
+                )
 
     # =========================================================
     # Helpers

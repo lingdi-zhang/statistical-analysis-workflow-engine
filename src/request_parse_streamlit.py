@@ -225,9 +225,8 @@ def build_cross_sectional_request(
 
     Returns
     -------
-    dict or None
-        Returns a request dictionary when the user
-        clicks "Inspect Data →". Otherwise returns None.
+    tuple
+        Current request and whether "Inspect Data →" was clicked.
     """
 
     metadata_columns = (
@@ -396,45 +395,43 @@ def build_cross_sectional_request(
         key="cross_inspect"
     )
 
-    if inspect_clicked:
+    request = {
+        "analysis_type":
+            "cross_sectional",
 
-        request = {
-            "analysis_type":
-                "cross_sectional",
+        "primary_predictors":
+            (
+                [predictor]
+                if predictor
+                is not None
+                else []
+            ),
 
-            "primary_predictors":
-                (
-                    [predictor]
-                    if predictor
-                    is not None
-                    else []
-                ),
+        "covariates":
+            covariates,
 
-            "covariates":
-                covariates,
+        "variable_types":
+            variable_types,
 
-            "variable_types":
-                variable_types,
+        "ordered_levels":
+            ordered_levels,
 
-            "ordered_levels":
-                ordered_levels,
+        "subset": {
+            "enabled":
+                use_subset
+                == "Yes",
 
-            "subset": {
-                "enabled":
-                    use_subset
-                    == "Yes",
+            "variable":
+                subset_variable,
 
-                "variable":
-                    subset_variable,
-
-                "value":
-                    subset_value
-            }
+            "value":
+                subset_value
         }
+    }
 
-        return request
+    return request, inspect_clicked
 
-    return None
+
 
 
 # ==========================================================
@@ -449,9 +446,8 @@ def build_longitudinal_request(
 
     Returns
     -------
-    dict or None
-        Returns a request dictionary when the user
-        clicks "Inspect Data →". Otherwise returns None.
+    tuple
+        Current request and whether "Inspect Data →" was clicked.
     """
 
     metadata_columns = (
@@ -634,6 +630,16 @@ def build_longitudinal_request(
         prefix="long"
     )
 
+    st.subheader("Random Effects")
+    random_effects = st.radio(
+        "Subject-specific effects",
+        options=["Random intercept only", "Random intercept + time slope"],
+        index=1,
+        key="long_random_effects",
+        help="Random intercepts allow subject baselines to differ. Time slopes also allow subject trajectories to differ and require more usable observations."
+    )
+    random_slope = random_effects == "Random intercept + time slope"
+
     st.divider()
 
     # ======================================================
@@ -646,42 +652,42 @@ def build_longitudinal_request(
         key="long_inspect"
     )
 
-    if inspect_clicked:
+    request = {
+        "analysis_type":
+            "longitudinal",
 
-        request = {
-            "analysis_type":
-                "longitudinal",
+        "random_slope": random_slope,
 
-            "analysis_goal":
-                analysis_goal,
+        "analysis_goal":
+            analysis_goal,
 
-            "subject_id":
-                subject_id,
+        "subject_id":
+            subject_id,
 
-            "time":
-                time_variable,
+        "time":
+            time_variable,
 
-            "primary_predictors":
-                (
-                    [predictor]
-                    if predictor
-                    is not None
-                    else []
-                ),
+        "primary_predictors":
+            (
+                [predictor]
+                if predictor
+                is not None
+                else []
+            ),
 
-            "covariates":
-                covariates,
+        "covariates":
+            covariates,
 
-            "variable_types":
-                variable_types,
+        "variable_types":
+            variable_types,
 
-            "ordered_levels":
-                ordered_levels
-        }
+        "ordered_levels":
+            ordered_levels
+    }
 
-        return request
+    return request, inspect_clicked
 
-    return None
+
 
 
 # ==========================================================
@@ -702,9 +708,8 @@ def render_request_builder(
 
     Returns
     -------
-    dict or None
-        Analysis request when the user clicks
-        "Inspect Data →"; otherwise None.
+    tuple
+        Current analysis request and whether inspection was requested.
 
     Notes
     -----

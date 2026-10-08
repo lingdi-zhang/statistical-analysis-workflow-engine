@@ -1,11 +1,13 @@
 import json
 import subprocess
 import tempfile
+from uuid import uuid4
 from pathlib import Path
 
 import pandas as pd
 
-from pathlib import Path
+RESULT_LABEL_TYPES = {name: "string" for name in
+                      ("feature", "predictor", "term", "contrast")}
 
 def run_r_analysis(
     metadata,
@@ -95,9 +97,22 @@ def run_r_analysis(
         # 1. Write metadata
         # ====================================================
 
-        metadata.to_csv(
+        # String serialization preserves long na_rep markers in numeric columns
+        # (pandas 3 can truncate them when formatting NumPy floating arrays).
+        # R restores numeric model types after reading the character CSV inputs.
+        transfer_metadata = metadata.astype("string")
+        transfer_data_matrix = data_matrix.astype("string")
+
+        missing_marker = "__omics_missing_" + uuid4().hex + "__"
+        while any(missing_marker in table.columns
+                  or table.astype("string").eq(missing_marker).any().any()
+                  for table in (transfer_metadata, transfer_data_matrix)):
+            missing_marker = "__omics_missing_" + uuid4().hex + "__"
+        transfer_request = dict(request, transfer_na_marker=missing_marker)
+
+        transfer_metadata.to_csv(
             metadata_path,
-            index=False
+            index=False, na_rep=missing_marker
         )
 
 
@@ -105,9 +120,9 @@ def run_r_analysis(
         # 2. Write outcome / omics matrix
         # ====================================================
 
-        data_matrix.to_csv(
+        transfer_data_matrix.to_csv(
             data_matrix_path,
-            index=False
+            index=False, na_rep=missing_marker
         )
 
 
@@ -121,7 +136,7 @@ def run_r_analysis(
         ) as f:
 
             json.dump(
-                request,
+                transfer_request,
                 f,
                 indent=2
             )
@@ -143,7 +158,7 @@ def run_r_analysis(
 
         if r_script is None:
             project_root = Path(__file__).resolve().parent.parent
-            r_script = project_root / "R" / "run_analysis.R"
+            r_script = project_root / "r" / "run_analysis.R"
 
         r_script = Path(r_script)
         command = [
@@ -209,7 +224,8 @@ def run_r_analysis(
 
 
         overall = pd.read_csv(
-            overall_path
+            overall_path, dtype=RESULT_LABEL_TYPES,
+            keep_default_na=False, na_values=[missing_marker]
         )
 
 
@@ -237,7 +253,8 @@ def run_r_analysis(
             try:
 
                 pairwise = pd.read_csv(
-                    pairwise_path
+                    pairwise_path, dtype=RESULT_LABEL_TYPES,
+                    keep_default_na=False, na_values=[missing_marker]
                 )
 
             except pd.errors.EmptyDataError:
@@ -280,7 +297,15 @@ def run_r_analysis(
         # 10. Return everything to app.py
         # ====================================================
 
+        diagnostics_path = summary_path.with_name("diagnostics.json")
+        diagnostics = {}
+        if diagnostics_path.exists():
+            with diagnostics_path.open() as handle:
+                diagnostics = json.load(handle)
+
         return {
+
+            "diagnostics": diagnostics,
 
             "overall":
                 overall,
@@ -298,7 +323,5 @@ def run_r_analysis(
             "r_stderr":
                 process.stderr
         }
-
-
 
 

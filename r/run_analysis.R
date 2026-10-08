@@ -121,29 +121,37 @@ summary_output <- args[6]
 # 3. Read input data
 # ============================================================
 
+request <- fromJSON(request_path, simplifyVector = TRUE)
+
+# Python supplies a collision-checked marker; retain compatibility with direct
+# command-line CSV inputs, whose blank cells represent missing values.
+missing_values <- request$transfer_na_marker
+if (is.null(missing_values)) missing_values <- ""
+
 metadata <- read.csv(
     metadata_path,
     check.names = FALSE,
-    stringsAsFactors = FALSE
+    stringsAsFactors = FALSE,
+    colClasses = "character",
+    na.strings = missing_values
 )
-
 
 data_matrix <- read.csv(
     data_matrix_path,
     check.names = FALSE,
-    stringsAsFactors = FALSE
-)
-
-
-request <- fromJSON(
-    request_path,
-    simplifyVector = TRUE
+    stringsAsFactors = FALSE,
+    colClasses = "character",
+    na.strings = missing_values
 )
 
 
 # ============================================================
 # 4. Extract common request parameters
 # ============================================================
+
+if (!all(vapply(list(metadata, data_matrix), function(table) {
+    "SampleID" %in% names(table)
+}, logical(1)))) stop("Both CSV inputs must contain SampleID.")
 
 analysis_type <- request$analysis_type
 
@@ -231,6 +239,9 @@ if (
 # ============================================================
 # 6. prepare variables 
 # ============================================================
+if (analysis_type == "longitudinal" && !is.null(request$time)) {
+    request$variable_types[[request$time]] <- "numeric"
+}
 metadata <- prepare_model_variables(
     dat = metadata,
     variable_types = request$variable_types,
@@ -306,22 +317,11 @@ if (
         predictor_type =
             predictor_type,
 
-        n_features =
-            ncol(data_matrix),
-
-        n_successful =
-            sum(
-                !is.na(
-                    final_results$p_value
-                )
-            ),
-
-        n_failed =
-            sum(
-                is.na(
-                    final_results$p_value
-                )
-            )
+        n_features = nrow(final_results),
+        n_successful = sum(is.finite(final_results$p_value)),
+        n_estimate_only = sum(final_results$status == "estimate_only", na.rm = TRUE),
+        n_failed = sum(!is.finite(final_results$p_value) &
+                       final_results$status != "estimate_only", na.rm = TRUE)
     )
 
 
@@ -608,7 +608,8 @@ write.csv(
 
     overall_output,
 
-    row.names = FALSE
+    row.names = FALSE,
+    na = missing_values[[1]]
 )
 
 
@@ -635,7 +636,8 @@ if (
 
         pairwise_output,
 
-        row.names = FALSE
+        row.names = FALSE,
+        na = missing_values[[1]]
     )
 
 } else {
@@ -664,6 +666,12 @@ write_json(
 )
 
 
+# Preserve final and first-pass optimizer histories independently of the summary.
+diagnostics_output <- file.path(dirname(summary_output), "diagnostics.json")
+write_json(list(final = results$diagnostics,
+                first_pass = results$first_pass_diagnostics),
+           diagnostics_output, pretty = TRUE, auto_unbox = TRUE, na = "null")
+
 # ============================================================
 # 12. Console completion message
 # ============================================================
@@ -671,5 +679,3 @@ write_json(
 message(
     "Analysis completed successfully."
 )
-
-
